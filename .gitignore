@@ -1,0 +1,15 @@
+# Build/output
+*.o
+*.out
+*.exe
+
+# Benchmark/generated results
+results.csv
+plot_data.dat
+
+# Images generated from plots
+# Uncomment if you do not want generated images tracked
+# *.png
+
+# System/editor
+.DS_Store
