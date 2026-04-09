@@ -1,14 +1,14 @@
-# Buffer SA Work – Compression Benchmark
+CPU-GPU Decompression Benchmark
 
-This repository contains my Student Assistant work related to compression benchmarking, including source code, benchmark setup, plotting scripts, and selected outputs.
+This project implements an RLE-based compression and decompression benchmark.
 
-## Repository Structure
-- `src/` – source code
-- `benchmark/` – benchmark-related files
-- `Makefile` / `makefile` – build instructions
-- `plot.gp` – plotting script
-- `throughput_line_graph.png` – sample benchmark visualization
+Features:
+- Synthetic dataset generation (skewed)
+- RLE compression (CPU)
+- CPU and GPU decompression
+- CPU-GPU ratio experiment
+- Throughput measurement
+- Visualization using gnuplot
 
-## Notes
-This repository is intended to document technical work in a clean and reproducible way.
-Sensitive or internal-only data is excluded.
+Goal:
+To analyze how decompression workload should be distributed between CPU and GPU.
