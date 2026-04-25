@@ -17,10 +17,9 @@ std::vector<uint32_t> generate_skewed(size_t N);
 
 struct Result {
     std::string ratio_label;
-    double avg_throughput_mbps;
-    double avg_throughput_rowsps;
-    double min_throughput_mbps;
-    double max_throughput_mbps;
+    double avg_total_mbps;
+    double min_total_mbps;
+    double max_total_mbps;
 };
 
 bool verify_equal(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
@@ -40,195 +39,163 @@ std::vector<uint32_t> concat_vectors(const std::vector<uint32_t>& a,
     return out;
 }
 
-// run one CPU:GPU ratio experiment 10 times and take average
-Result run_ratio_benchmark(const std::vector<uint32_t>& data, int cpu_percent) {
+// Debug benchmark with warm-up and detailed timing
+Result run_ratio_benchmark_debug(const std::vector<uint32_t>& data, int cpu_percent) {
     const int NUM_RUNS = 10;
 
-    std::vector<double> mbps_values;
-    std::vector<double> rowsps_values;
+    // compress once on CPU
+    std::vector<RLEPair> compressed = rle_compress(data);
+
+    std::size_t total_pairs = compressed.size();
+    std::size_t cpu_pairs = (total_pairs * cpu_percent) / 100;
+    std::size_t gpu_pairs = total_pairs - cpu_pairs;
+
+    std::vector<RLEPair> cpu_part(compressed.begin(), compressed.begin() + cpu_pairs);
+    std::vector<RLEPair> gpu_part(compressed.begin() + cpu_pairs, compressed.end());
+
+    double original_bytes = static_cast<double>(data.size() * sizeof(uint32_t));
+
+    std::cout << "\n====================================================\n";
+    std::cout << "CPU:GPU ratio = " << cpu_percent << ":" << (100 - cpu_percent) << "\n";
+    std::cout << "Total compressed pairs = " << total_pairs << "\n";
+    std::cout << "CPU pairs = " << cpu_pairs << ", GPU pairs = " << gpu_pairs << "\n";
+    std::cout << "====================================================\n";
+
+    // GPU warm-up (very important)
+    if (!gpu_part.empty()) {
+        double warmup_gpu_time = 0.0;
+        std::vector<uint32_t> warmup_out = rle_decompress_gpu(gpu_part, warmup_gpu_time);
+        std::cout << "Warm-up GPU run done. GPU internal time = "
+                  << warmup_gpu_time << " s\n";
+    }
+
+    std::vector<double> total_mbps_values;
 
     for (int run = 0; run < NUM_RUNS; run++) {
-        // Step 1: compress on CPU
-        std::vector<RLEPair> compressed = rle_compress(data);
-
-        std::size_t total_pairs = compressed.size();
-        std::size_t cpu_pairs = (total_pairs * cpu_percent) / 100;
-
-        std::vector<RLEPair> cpu_part(compressed.begin(), compressed.begin() + cpu_pairs);
-        std::vector<RLEPair> gpu_part(compressed.begin() + cpu_pairs, compressed.end());
-
-        double original_bytes = static_cast<double>(data.size() * sizeof(uint32_t));
-
-        // Step 2: start timing
-        auto start = std::chrono::high_resolution_clock::now();
-
-        // Step 3: CPU decompress its part
         std::vector<uint32_t> cpu_output;
+        std::vector<uint32_t> gpu_output;
+
+        // total timing
+        auto total_start = std::chrono::high_resolution_clock::now();
+
+        // CPU timing
+        auto cpu_start = std::chrono::high_resolution_clock::now();
         if (!cpu_part.empty()) {
             cpu_output = rle_decompress_cpu(cpu_part);
         }
+        auto cpu_end = std::chrono::high_resolution_clock::now();
+        double cpu_seconds = std::chrono::duration<double>(cpu_end - cpu_start).count();
 
-        // Step 4: GPU part is transferred and decompressed on GPU
-        std::vector<uint32_t> gpu_output;
-        double gpu_seconds_internal = 0.0;
+        // GPU timing (this already includes transfer + GPU decompress + copy back)
+        double gpu_seconds = 0.0;
         if (!gpu_part.empty()) {
-            gpu_output = rle_decompress_gpu(gpu_part, gpu_seconds_internal);
+            gpu_output = rle_decompress_gpu(gpu_part, gpu_seconds);
         }
 
-        // Step 5: combine outputs
+        // combine
         std::vector<uint32_t> final_output = concat_vectors(cpu_output, gpu_output);
 
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> total_diff = end - start;
-        double total_seconds = total_diff.count();
+        auto total_end = std::chrono::high_resolution_clock::now();
+        double total_seconds = std::chrono::duration<double>(total_end - total_start).count();
 
-        // verify correctness on first run only
+        // verify only once
         if (run == 0) {
             bool ok = verify_equal(data, final_output);
-            std::cout << "CPU:GPU = " << cpu_percent << ":" << (100 - cpu_percent)
-                      << " verification: " << (ok ? "PASS" : "FAIL") << "\n";
+            std::cout << "Verification: " << (ok ? "PASS" : "FAIL") << "\n";
         }
 
-        double rows_per_sec = static_cast<double>(data.size()) / total_seconds;
-        double mb_per_sec = (original_bytes / (1024.0 * 1024.0)) / total_seconds;
+        double total_mbps = (original_bytes / (1024.0 * 1024.0)) / total_seconds;
+        total_mbps_values.push_back(total_mbps);
 
-        mbps_values.push_back(mb_per_sec);
-        rowsps_values.push_back(rows_per_sec);
+        std::cout << "Run " << (run + 1)
+                  << " | CPU time = " << cpu_seconds << " s"
+                  << " | GPU path time = " << gpu_seconds << " s"
+                  << " | Total time = " << total_seconds << " s"
+                  << " | Total throughput = " << total_mbps << " MB/s"
+                  << "\n";
     }
 
-    // compute average
-    double sum_mbps = 0.0;
-    double sum_rowsps = 0.0;
-    for (int i = 0; i < NUM_RUNS; i++) {
-        sum_mbps += mbps_values[i];
-        sum_rowsps += rowsps_values[i];
+    // average / min / max
+    double sum = 0.0;
+    for (double v : total_mbps_values) sum += v;
+    double avg = sum / NUM_RUNS;
+
+    double min_val = total_mbps_values[0];
+    double max_val = total_mbps_values[0];
+
+    for (double v : total_mbps_values) {
+        if (v < min_val) min_val = v;
+        if (v > max_val) max_val = v;
     }
 
-    double avg_mbps = sum_mbps / NUM_RUNS;
-    double avg_rowsps = sum_rowsps / NUM_RUNS;
-
-    // compute min and max
-    double min_mbps = mbps_values[0];
-    double max_mbps = mbps_values[0];
-
-    for (double v : mbps_values) {
-        if (v < min_mbps) min_mbps = v;
-        if (v > max_mbps) max_mbps = v;
-    }
-
-    std::cout << "CPU:GPU = " << cpu_percent << ":" << (100 - cpu_percent)
-              << " average MB/s = " << avg_mbps
-              << " (min = " << min_mbps
-              << ", max = " << max_mbps << ")\n";
+    std::cout << "Average throughput = " << avg << " MB/s\n";
+    std::cout << "Min throughput = " << min_val << " MB/s\n";
+    std::cout << "Max throughput = " << max_val << " MB/s\n";
 
     Result r;
     r.ratio_label = std::to_string(cpu_percent) + ":" + std::to_string(100 - cpu_percent);
-    r.avg_throughput_mbps = avg_mbps;
-    r.avg_throughput_rowsps = avg_rowsps;
-    r.min_throughput_mbps = min_mbps;
-    r.max_throughput_mbps = max_mbps;
+    r.avg_total_mbps = avg;
+    r.min_total_mbps = min_val;
+    r.max_total_mbps = max_val;
 
     return r;
 }
 
 void print_table(const std::vector<Result>& results) {
-    std::cout << "-----------------------------------------------------------------------------------------------\n";
-    std::cout << "| CPU:GPU Ratio | Avg MB/s | Avg Rows/s           | Min MB/s | Max MB/s |\n";
-    std::cout << "-----------------------------------------------------------------------------------------------\n";
+    std::cout << "\n-----------------------------------------------------------------\n";
+    std::cout << "| CPU:GPU Ratio | Avg MB/s | Min MB/s | Max MB/s |\n";
+    std::cout << "-----------------------------------------------------------------\n";
 
     for (const auto& r : results) {
         std::cout << "| "
                   << std::setw(13) << std::left << r.ratio_label
                   << "| "
-                  << std::setw(9) << std::left << std::setprecision(4) << r.avg_throughput_mbps
+                  << std::setw(9) << std::left << std::setprecision(4) << r.avg_total_mbps
                   << "| "
-                  << std::setw(21) << std::left << std::setprecision(4) << r.avg_throughput_rowsps
+                  << std::setw(9) << std::left << std::setprecision(4) << r.min_total_mbps
                   << "| "
-                  << std::setw(9) << std::left << std::setprecision(4) << r.min_throughput_mbps
-                  << "| "
-                  << std::setw(9) << std::left << std::setprecision(4) << r.max_throughput_mbps
+                  << std::setw(9) << std::left << std::setprecision(4) << r.max_total_mbps
                   << "|\n";
     }
 
-    std::cout << "-----------------------------------------------------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------------------\n";
 }
 
 void save_csv(const std::vector<Result>& results) {
-    std::ofstream file("ratio_results.csv");
-    file << "CPU_GPU_Ratio,Avg_Throughput_MBps,Avg_Throughput_Rowsps,Min_Throughput_MBps,Max_Throughput_MBps\n";
+    std::ofstream file("ratio_results_debug.csv");
+    file << "CPU_GPU_Ratio,Avg_MBps,Min_MBps,Max_MBps\n";
 
     for (const auto& r : results) {
         file << r.ratio_label << ","
-             << r.avg_throughput_mbps << ","
-             << r.avg_throughput_rowsps << ","
-             << r.min_throughput_mbps << ","
-             << r.max_throughput_mbps << "\n";
+             << r.avg_total_mbps << ","
+             << r.min_total_mbps << ","
+             << r.max_total_mbps << "\n";
     }
 
     file.close();
-    std::cout << "\nResults saved to ratio_results.csv\n";
-}
-
-void save_bar_plot(const std::vector<Result>& results) {
-    std::ofstream data("ratio_plot_data.dat");
-    // index  avg  low  high  label
-    for (std::size_t i = 0; i < results.size(); i++) {
-        double lower_err = results[i].avg_throughput_mbps - results[i].min_throughput_mbps;
-        double upper_err = results[i].max_throughput_mbps - results[i].avg_throughput_mbps;
-
-        data << i << " "
-             << results[i].avg_throughput_mbps << " "
-             << lower_err << " "
-             << upper_err << " "
-             << results[i].ratio_label << "\n";
-    }
-    data.close();
-
-    std::ofstream gp("ratio_plot.gp");
-    gp << "set terminal pngcairo size 1000,600\n";
-    gp << "set output 'ratio_bar_plot.png'\n";
-    gp << "set title 'RLE Throughput vs CPU:GPU Ratio (Average of 10 Runs)'\n";
-    gp << "set xlabel 'CPU:GPU Ratio'\n";
-    gp << "set ylabel 'Throughput (MB/s)'\n";
-    gp << "set grid ytics\n";
-    gp << "set boxwidth 0.6\n";
-    gp << "set style fill solid border -1\n";
-    gp << "set yrange [0:*]\n";
-    gp << "set xtics rotate by -45\n";
-    gp << "set xtics (";
-    for (std::size_t i = 0; i < results.size(); i++) {
-        gp << "'" << results[i].ratio_label << "' " << i;
-        if (i + 1 < results.size()) gp << ", ";
-    }
-    gp << ")\n";
-    gp << "plot 'ratio_plot_data.dat' using 1:2 with boxes title 'Average Throughput', \\\n";
-    gp << "     '' using 1:2:3:4 with yerrorbars notitle\n";
-    gp.close();
-
-    int rc = std::system("gnuplot ratio_plot.gp");
-    if (rc == 0) {
-        std::cout << "Bar plot saved to ratio_bar_plot.png\n";
-    } else {
-        std::cout << "Could not generate bar plot.\n";
-    }
+    std::cout << "\nResults saved to ratio_results_debug.csv\n";
 }
 
 int main() {
     std::size_t N = 10000000;
 
-    // Use one dataset only, as discussed with professor/mentor
+    // keep one dataset fixed
     std::vector<uint32_t> data = generate_skewed(N);
 
     std::vector<Result> results;
-    results.push_back(run_ratio_benchmark(data, 100));
-    results.push_back(run_ratio_benchmark(data, 75));
-    results.push_back(run_ratio_benchmark(data, 50));
-    results.push_back(run_ratio_benchmark(data, 25));
-    results.push_back(run_ratio_benchmark(data, 0));
+
+    // You can run only 75:25 first for debugging:
+    // results.push_back(run_ratio_benchmark_debug(data, 75));
+
+    // Or all ratios:
+    results.push_back(run_ratio_benchmark_debug(data, 100));
+    results.push_back(run_ratio_benchmark_debug(data, 75));
+    results.push_back(run_ratio_benchmark_debug(data, 50));
+    results.push_back(run_ratio_benchmark_debug(data, 25));
+    results.push_back(run_ratio_benchmark_debug(data, 0));
 
     print_table(results);
     save_csv(results);
-    save_bar_plot(results);
 
     return 0;
 }
