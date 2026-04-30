@@ -1,6 +1,6 @@
 set terminal pngcairo size 1000,600
 set output 'ratio_bar_plot.png'
-set title 'RLE Throughput vs CPU:GPU Ratio (Average of 10 Runs)'
+set title 'RLE Throughput vs CPU:GPU Ratio (Warm-up Excluded)'
 set xlabel 'CPU:GPU Ratio'
 set ylabel 'Throughput (MB/s)'
 set grid ytics
